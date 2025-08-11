@@ -35,13 +35,16 @@ HOP_MS   = 10               # hop (ms, 100 Hz)
 
 # Macro knobs (fast tuning)
 SWAY_MASTER    = 1.5        # global multiplier for ALL motion amplitudes (1.5 ≈ +50%)
-SENS_DB_OFFSET = 0.0        # dB added to measured dBFS before loudness mapping (e.g. +6.0)
+SENS_DB_OFFSET = +4.0 #0.0        # dB added to measured dBFS before loudness mapping (e.g. +6.0)
 
 # VAD thresholds (durable lines on plot)
 VAD_DB_ON  = -35.0
 VAD_DB_OFF = -45.0
-VAD_ATTACK_MS  = 120
+VAD_ATTACK_MS  = 40 #120
 VAD_RELEASE_MS = 250
+
+# Faster envelope follow (add this next to other tunables)
+ENV_FOLLOW_GAIN = 0.65  
 
 # Continuous 6-DoF "speech sway" while VAD is ON
 # Frequencies (Hz) and *base* peak amplitudes (deg or mm). All amplitudes are
@@ -65,7 +68,7 @@ SWAY_DB_HIGH = -18.0        # above → full sway
 LOUDNESS_GAMMA = 0.9        # <1 slightly compresses; >1 expands
 
 # Sway envelope (attack/release around VAD edges)
-SWAY_ATTACK_MS  = 120
+SWAY_ATTACK_MS  = 50 # 120
 SWAY_RELEASE_MS = 250
 
 # Plot and monitoring
@@ -187,7 +190,7 @@ class Analyzer:
                     down_gain = 1.0 - (self.sway_down / SWAY_RELEASE_FR)
                     target_env = up_gain if self.vad_on else down_gain
                     # 1st-order follow (critically damped-ish)
-                    self.sway_env += 0.3 * (target_env - self.sway_env)
+                    self.sway_env += ENV_FOLLOW_GAIN * (target_env - self.sway_env)
                     self.sway_env = max(0.0, min(1.0, self.sway_env))
 
                     # logs for plotting
@@ -311,6 +314,18 @@ def run():
                     cmd_pitch_line.set_data(tc, pcmd)
                     cmd_yaw_line.set_data(tc, ycmd)
                     cmd_roll_line.set_data(tc, rcmd)
+                    
+                    # --- autoscale commanded-angles panel (robust, symmetric, not jittery) ---
+                    if tc:
+                        vals = np.concatenate([
+                            np.asarray(pcmd, dtype=float),
+                            np.asarray(ycmd, dtype=float),
+                            np.asarray(rcmd, dtype=float),
+                        ])
+                        # 99th percentile of absolute value to ignore outliers
+                        amax = float(np.percentile(np.abs(vals), 99)) if vals.size else 5.0
+                        amax = max(5.0, amax)              # never tighter than ±5°
+                        ax3.set_ylim(-1.2*amax, 1.2*amax)  # small headroom to avoid clipping
 
                     for ax in (ax1, ax3):
                         ax.set_xlim(tmin, max(tmin + 0.5, tmax))
