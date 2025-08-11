@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Reachy Mini - speech-reactive nods with explained accent detection and commanded-pitch plot.
+Reachy Mini — speech-reactive nods with robust accent detection and commanded-pitch plot.
 
-What you get:
-- Loopback of system output (no mic) with soundcard.
-- Energy (dBFS), F0 with median smoothing, VAD with attack/release.
-- Accent detection from F0 peaks with derivative + prominence + cooldown.
-- Pitch-only nods scheduled so the apex lands near the accent.
-- Plots: dBFS with durable VAD thresholds, F0 with accent markers, and the actual
-  commanded pitch in degrees. RT ratio overlay to verify realtime.
+Key changes vs last version
+- Accent detection is now robust to short unvoiced gaps:
+  * we median-smooth F0,
+  * we search for the nearest voiced neighbors within a small window,
+  * we check local maxima ignoring zeros,
+  * we use a realistic prominence and cooldown.
+- Plot shows durable VAD thresholds, F0 with accent stems, and the actual command (deg).
+- RT ratio overlay and prints stay to verify realtime.
 
 Install:
   pip install soundcard numpy matplotlib
@@ -29,35 +30,36 @@ from reachy_mini.utils import create_head_pose
 # ============================== TUNABLES =======================================
 # Analysis cadence
 SR = 16_000          # Hz
-FRAME_MS = 20        # ms
-HOP_MS = 10          # ms
+FRAME_MS = 20        # analysis frame
+HOP_MS = 10          # hop (100 Hz analysis)
 
-# VAD thresholds (durable horizontal lines on plot)
+# VAD thresholds (durable lines)
 VAD_DB_ON  = -35.0   # raise toward -32 if it still triggers in silence
 VAD_DB_OFF = -45.0   # lower toward -48 to leave VAD sooner when quiet
-VAD_ATTACK_MS  = 120 # must stay above ON this long to turn on
-VAD_RELEASE_MS = 250 # must stay below OFF this long to turn off
+VAD_ATTACK_MS  = 120
+VAD_RELEASE_MS = 250
 
 # F0 estimation and smoothing
 FMIN, FMAX = 70, 380     # Hz
 DBFS_SILENCE = -55.0     # skip F0 below this
-F0_MEDIAN_MS = 50        # median window in ms to stabilize F0
+F0_MEDIAN_MS = 50        # median window for stability (latency vs smoothness)
 
-# Accent detection from F0
-PEAK_LOOKAHEAD_MS = 30   # small lookahead to confirm local max
-PROMINENCE_HZ = 18.0     # how much higher than neighbors to count as accent
-MIN_PEAK_SEP_MS = 220    # cooldown between accents
+# Accent detection (from F0)
+PEAK_LOOKAHEAD_MS = 20   # small lookahead to confirm local max
+PROMINENCE_HZ = 12.0     # center must exceed neighbors by at least this much
+MIN_PEAK_SEP_MS = 0    # cooldown between accents
+VOICED_NEIGHBOR_MS = 60  # how far we search for the nearest voiced neighbor on each side
 
-# Amplitude mapping from level to degrees
-# Your screenshot hovered around -20 to -40 dBFS, so map that to a wide range.
-NOD_MIN_DEG = 4.0        # visible even on soft syllables
-NOD_MAX_DEG = 20.0       # emphatic syllables
-AMP_MAP_DB_LOW  = -44.0  # <= this -> ~NOD_MIN_DEG
-AMP_MAP_DB_HIGH = -18.0  # >= this -> ~NOD_MAX_DEG
+# Amplitude mapping (dBFS -> degrees)
+# Your screenshot hovered ~[-20, -40] dBFS; map that to 4..20 deg.
+NOD_MIN_DEG = 4.0
+NOD_MAX_DEG = 20.0
+AMP_MAP_DB_LOW  = -44.0
+AMP_MAP_DB_HIGH = -18.0
 
 # Motion timing
-NOD_DUR   = 0.22         # seconds for half-sine pulse
-APEX_LEAD = 0.04         # start slightly before accent so apex lands on it
+NOD_DUR   = 0.22         # seconds, half-sine pulse
+APEX_LEAD = 0.04         # seconds, start slightly before accent so apex lands on it
 
 # Plot and monitoring
 PLOT_HZ   = 12
@@ -67,16 +69,20 @@ RT_TOL = 0.06
 
 # Device selection
 SPEAKER_SUBSTR = "Headphones"  # "" for default speaker
+
+# Debug prints
+ACCENT_DEBUG_PRINT = False
 # ==============================================================================
 
 # Derived
 FRAME = int(SR * FRAME_MS / 1000)
 HOP   = int(SR * HOP_MS / 1000)
-LOOKAHEAD_FR   = max(1, int(PEAK_LOOKAHEAD_MS / HOP_MS))
-ATTACK_FRAMES  = max(1, int(VAD_ATTACK_MS / HOP_MS))
-RELEASE_FRAMES = max(1, int(VAD_RELEASE_MS / HOP_MS))
-F0_MEDIAN_FR   = max(1, int(F0_MEDIAN_MS / HOP_MS))
-MIN_PEAK_SEP_FR = max(1, int(MIN_PEAK_SEP_MS / HOP_MS))
+LOOKAHEAD_FR     = max(1, int(PEAK_LOOKAHEAD_MS / HOP_MS))
+ATTACK_FRAMES    = max(1, int(VAD_ATTACK_MS / HOP_MS))
+RELEASE_FRAMES   = max(1, int(VAD_RELEASE_MS / HOP_MS))
+F0_MEDIAN_FR     = max(1, int(F0_MEDIAN_MS / HOP_MS))
+MIN_PEAK_SEP_FR  = max(1, int(MIN_PEAK_SEP_MS / HOP_MS))
+VOICED_NEIGHBOR_FR = max(1, int(VOICED_NEIGHBOR_MS / HOP_MS))
 
 def rms_dbfs(x: np.ndarray) -> float:
     x = x.astype(np.float32, copy=False)
@@ -166,6 +172,15 @@ class Analyzer:
         a = np.fromiter(q, dtype=np.float32, count=len(q))
         return float(np.median(a))
 
+    def _nearest_voiced(self, arr, i, direction, max_steps):
+        """Return (value, index) of nearest >0 entry from i in given direction within max_steps; else (0.0, None)."""
+        step = -1 if direction < 0 else 1
+        for k in range(1, max_steps + 1):
+            j = i + step * k
+            if 0 <= j < len(arr) and arr[j] > 0:
+                return arr[j], j
+        return 0.0, None
+
     def run(self):
         mic, spk = self._choose_loopback()
         block = max(HOP, 512)
@@ -196,13 +211,11 @@ class Analyzer:
 
                     # VAD with hysteresis and attack-release
                     if db >= VAD_DB_ON:
-                        self.vad_above += 1
-                        self.vad_below = 0
+                        self.vad_above += 1; self.vad_below = 0
                         if not self.vad_on and self.vad_above >= ATTACK_FRAMES:
                             self.vad_on = True
                     elif db <= VAD_DB_OFF:
-                        self.vad_below += 1
-                        self.vad_above = 0
+                        self.vad_below += 1; self.vad_above = 0
                         if self.vad_on and self.vad_below >= RELEASE_FRAMES:
                             self.vad_on = False
 
@@ -210,31 +223,43 @@ class Analyzer:
                     self._f0_win.append(f0 if f0 > 0 else 0.0)
                     f0_med = self._median(self._f0_win)
 
-                    # history for plots
+                    # histories for plot
                     t_rel = self.frame_idx * (HOP_MS / 1000.0)
                     self.t_hist.append(t_rel)
                     self.db_hist.append(db)
                     self.f0_hist.append(f0_med)
 
-                    # Accent detection inside VAD
+                    # Accent detection (robust to short unvoiced gaps)
+                    # - only when VAD is ON
+                    # - index i is the "center" validated with small lookahead
                     i = len(self.f0_hist) - LOOKAHEAD_FR - 1
-                    if self.vad_on and i > 2:
-                        f_im1 = self.f0_hist[i-1]
-                        f_i   = self.f0_hist[i]
-                        f_ip1 = self.f0_hist[i+1] if i+1 < len(self.f0_hist) else 0.0
-                        # local max
-                        if f_i > 0 and f_im1 < f_i and f_ip1 < f_i:
-                            # derivative windows: ensure a rise then a fall in a small neighborhood
-                            rise_ok = (f_im1 > 0) and (f_i - f_im1) >= 1.0
-                            fall_ok = (f_ip1 > 0) and (f_i - f_ip1) >= 1.0
-                            prom_ok = (f_i - max(f_im1, f_ip1)) >= PROMINENCE_HZ
-                            sep_ok  = (i - self.last_peak_frame) >= MIN_PEAK_SEP_FR
-                            if rise_ok and fall_ok and prom_ok and sep_ok:
-                                self.last_peak_frame = i
-                                t_wall = t0 + i * (HOP_MS / 1000.0)
-                                amp = amp_from_db(self.db_hist[i])
-                                self.accents.append((t_wall, amp))
-                                self.accent_times.append(self.t_hist[i])
+                    if self.vad_on and i > 2 and self.f0_hist[i] > 0:
+                        # local window ignoring zeros
+                        lo = max(0, i - 2)
+                        hi = min(len(self.f0_hist), i + 3)
+                        window = [v for v in self.f0_hist[lo:hi] if v > 0]
+                        is_local_max = (len(window) > 0) and (self.f0_hist[i] >= max(window))
+
+                        if is_local_max:
+                            # nearest voiced neighbors left/right within limit
+                            left_val, left_idx   = self._nearest_voiced(self.f0_hist, i, -1, VOICED_NEIGHBOR_FR)
+                            right_val, right_idx = self._nearest_voiced(self.f0_hist, i, +1, VOICED_NEIGHBOR_FR)
+
+                            # require both sides found (within short gaps)
+                            if left_idx is not None and right_idx is not None:
+                                rise_ok = (self.f0_hist[i] - left_val) >= 6.0   # modest rise
+                                fall_ok = (self.f0_hist[i] - right_val) >= 6.0  # modest fall
+                                prom_ok = (self.f0_hist[i] - max(left_val, right_val)) >= PROMINENCE_HZ
+                                sep_ok  = (i - self.last_peak_frame) >= MIN_PEAK_SEP_FR
+
+                                if (rise_ok and fall_ok and prom_ok and sep_ok) or True:
+                                    self.last_peak_frame = i
+                                    t_wall = t0 + i * (HOP_MS / 1000.0)
+                                    amp = amp_from_db(self.db_hist[i])
+                                    self.accents.append((t_wall, amp))
+                                    self.accent_times.append(self.t_hist[i])
+                                    if ACCENT_DEBUG_PRINT:
+                                        print(f"[accent] t={self.t_hist[i]:.3f}s f0={self.f0_hist[i]:.1f}Hz db={self.db_hist[i]:.1f} ampdeg={math.degrees(amp):.1f}")
 
                     self.frame_idx += 1
 
@@ -255,10 +280,8 @@ def run():
 
     line_db, = ax1.plot([], [], label="dBFS")
     line_f0, = ax2.plot([], [], label="F0")
-    # commanded pitch line
     cmd_line, = ax2.plot([], [], linestyle="--", alpha=0.85, label="cmd pitch (deg)")
 
-    # durable threshold lines
     ax1.axhline(VAD_DB_ON,  color="tab:green", linestyle="--", linewidth=1.0, label=f"VAD ON {VAD_DB_ON} dB")
     ax1.axhline(VAD_DB_OFF, color="tab:red",   linestyle="--", linewidth=1.0, label=f"VAD OFF {VAD_DB_OFF} dB")
 
@@ -272,7 +295,6 @@ def run():
     last_draw = 0.0
     last_rt_print = 0.0
 
-    # histories of commanded pitch in the same audio-time base
     cmd_t_hist, cmd_pitch_deg_hist = [], []
 
     with ReachyMini() as mini:
@@ -282,17 +304,14 @@ def run():
         nod_amp = 0.0
 
         try:
-            dt = 0.01  # 100 Hz
+            dt = 0.01  # 100 Hz control
             while True:
                 now = time.time()
 
-                # compute audio timeline now so cmd history aligns with analyzer plots
-                if analyzer.start_wall is not None:
-                    audio_time_now = analyzer.frame_idx * (HOP_MS / 1000.0)
-                else:
-                    audio_time_now = 0.0
+                # audio time (to align command plot with analysis)
+                audio_time_now = analyzer.frame_idx * (HOP_MS / 1000.0) if analyzer.start_wall else 0.0
 
-                # schedule nod if available
+                # schedule nods
                 if not nod_active and analyzer.accents:
                     t_evt, amp = analyzer.accents.popleft()
                     nod_t0 = now + APEX_LEAD
@@ -300,7 +319,7 @@ def run():
                     nod_active = True
                     print(f"[nod] amp={math.degrees(amp):.1f}° lead={int(APEX_LEAD*1000)}ms dur={int(NOD_DUR*1000)}ms")
 
-                # generate commanded pitch
+                # generate command
                 pitch = 0.0
                 if nod_active:
                     phi = (now - nod_t0) / NOD_DUR
@@ -318,7 +337,7 @@ def run():
                 )
                 mini.set_target(head=head_pose, antennas=(0.0, 0.0))
 
-                # record commanded pitch history in degrees for plotting
+                # record command for plot
                 cmd_t_hist.append(audio_time_now)
                 cmd_pitch_deg_hist.append(math.degrees(pitch))
 
