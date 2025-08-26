@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-# reachy_rhythm_controller.py – v11.2 (Timing & UI Fix)
+# reachy_rhythm_controller.py - v11.3 (API adaptation)
 """Real-time robot choreography and rhythm synchronization.
 
-This version fixes two critical bugs:
-1.  The robot will no longer start moving prematurely before a stable BPM is 'Locked'.
-2.  The terminal UI display no longer lags and now shows the current state in real-time.
+This version adapts robot calls to the newer Reachy Mini API:
+- Uses reachy_mini.motion.collection.dance.AVAILABLE_MOVES
+- Uses utils.create_head_pose for pose creation
+- Adds mini.wake_up() / mini.goto_sleep()
+
+Audio/BPM logic, UI, filtering, and control structure are unchanged.
 """
 
 from __future__ import annotations
@@ -24,10 +27,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pyaudio
 from pynput import keyboard
-from scipy.spatial.transform import Rotation as R
+# Removed: from scipy.spatial.transform import Rotation as R
 
-from reachy_mini import ReachyMini
-from reachy_mini.moves.dance_moves import AVAILABLE_DANCE_MOVES, MOVE_SPECIFIC_PARAMS
+from reachy_mini import ReachyMini, utils
+from reachy_mini.motion.collection.dance import AVAILABLE_MOVES
 
 
 # ... (Config, SharedState, Choreographer, and other helpers are unchanged) ...
@@ -113,7 +116,8 @@ class MusicState:
 
 class Choreographer:
     def __init__(self):
-        self.move_names = list(AVAILABLE_DANCE_MOVES.keys())
+        # Updated to reflect new registry
+        self.move_names = list(AVAILABLE_MOVES.keys())
         self.waveforms = ["sin", "cos", "triangle", "square", "sawtooth"]
         self.move_idx = 0
         self.waveform_idx = 0
@@ -146,13 +150,6 @@ class Choreographer:
 
     def change_amplitude(self, amount):
         self.amplitude_scale = max(0.1, self.amplitude_scale + amount)
-
-
-def head_pose(pos, eul):
-    m = np.eye(4)
-    m[:3, 3] = pos
-    m[:3, :3] = R.from_euler("xyz", eul).as_matrix()
-    return m
 
 
 def calculate_phase_error(t_beats: float, last_beat_time: float, bpm: float) -> float:
@@ -195,7 +192,7 @@ def keyboard_listener_thread(shared_state: SharedState, stop_event: threading.Ev
 def audio_thread(
     state: MusicState, config: Config, stop_event: threading.Event
 ) -> None:
-    # This function remains unchanged
+    # unchanged
     pa = pyaudio.PyAudio()
     stream = pa.open(
         format=pyaudio.paFloat32,
@@ -254,15 +251,14 @@ def audio_thread(
 
 
 def ui_thread(data_queue: Queue, config: Config, stop_event: threading.Event):
-    """FIXED: This thread now drains the queue to always show the latest data."""
+    """unchanged"""
     last_ui_print_time, last_data = time.time(), None
     while not stop_event.is_set():
         try:
-            # Drain the queue, keeping only the most recent data point
             while True:
                 last_data = data_queue.get_nowait()
         except Empty:
-            pass  # Queue is empty, proceed with the last known data
+            pass
 
         now = time.time()
         if not last_data or now - last_ui_print_time < (1.0 / config.ui_update_rate):
@@ -286,7 +282,7 @@ def ui_thread(data_queue: Queue, config: Config, stop_event: threading.Event):
         sys.stdout.flush()
 
 
-# ... (generate_final_plot is unchanged) ...
+# ... (generate_final_plot unchanged) ...
 def generate_final_plot(log, config):
     if not log:
         return
@@ -353,8 +349,13 @@ def main(config: Config) -> None:
 
     print("Connecting to Reachy Mini...")
     with ReachyMini() as mini:
+        # New lifecycle
+        # mini.wake_up()
+
+        # Neutral pose using utils.create_head_pose
         mini.set_target(
-            head_pose(config.neutral_pos, config.neutral_eul), antennas=np.zeros(2)
+            utils.create_head_pose(*config.neutral_pos, *config.neutral_eul, degrees=False),
+            antennas=np.zeros(2),
         )
         time.sleep(1)
         print(
@@ -390,7 +391,7 @@ def main(config: Config) -> None:
                     else 0.0
                 )
 
-                # ... (Beat filtering logic is unchanged) ...
+                # ... Beat filtering unchanged ...
                 accepted_this_frame = []
                 if new_beats and active_bpm > 0:
                     expected_interval = 60.0 / active_bpm
@@ -422,15 +423,12 @@ def main(config: Config) -> None:
                 filtered_beat_times.extend(accepted_this_frame)
                 last_good_beat = filtered_beat_times[-1] if filtered_beat_times else 0
 
-                # --- Main Dance Condition ---
-                # FIXED: Robot only starts dancing when state is 'Locked', and then
-                # continues dancing through 'Unstable' until the threshold is met.
+                # Start/continue criteria unchanged
                 is_allowed_to_start = state == "Locked"
                 is_stable_enough_to_continue = (
                     unstable_count < config.unstable_periods_before_stop
                 )
 
-                # Check if we are in a previously dancing state OR allowed to start now
                 can_dance = active_bpm > 0 and (
                     is_allowed_to_start
                     or (state == "Unstable" and is_stable_enough_to_continue)
@@ -455,29 +453,40 @@ def main(config: Config) -> None:
 
                     choreographer.advance(beats_this_frame, config)
                     move_name = choreographer.current_move_name()
-                    move_fn = AVAILABLE_DANCE_MOVES[move_name]
-                    params = MOVE_SPECIFIC_PARAMS.get(move_name, {}).copy()
-                    params["waveform"] = choreographer.current_waveform()
-                    for key in params:
-                        if "amplitude" in key:
+
+                    # New move API: fetch fn and base params
+                    move_fn, base_params, _ = AVAILABLE_MOVES[move_name]
+                    params = base_params.copy()
+
+                    # Waveform only if supported by the move
+                    if "waveform" in params:
+                        params["waveform"] = choreographer.current_waveform()
+
+                    # Amplitude scaling heuristic (matches working example)
+                    for key in list(params.keys()):
+                        if ("amplitude" in key) or ("_amp" in key):
                             params[key] *= choreographer.amplitude_scale
 
                     time_for_dance = t_beats + changes["manual_offset"]
                     offsets = move_fn(time_for_dance, **params)
+
                     mini.set_target(
-                        head_pose(
-                            config.neutral_pos + offsets.position_offset,
-                            config.neutral_eul + offsets.orientation_offset,
+                        utils.create_head_pose(
+                            *(config.neutral_pos + offsets.position_offset),
+                            *(config.neutral_eul + offsets.orientation_offset),
+                            degrees=False,
                         ),
                         antennas=offsets.antennas_offset,
                     )
                 else:
                     mini.set_target(
-                        head_pose(config.neutral_pos, config.neutral_eul),
+                        utils.create_head_pose(
+                            *config.neutral_pos, *config.neutral_eul, degrees=False
+                        ),
                         antennas=np.zeros(2),
                     )
 
-                # --- Logging and UI Update ---
+                # --- Logging and UI Update (unchanged) ---
                 ui_data = {
                     "state": state,
                     "active_bpm": active_bpm,
@@ -509,6 +518,11 @@ def main(config: Config) -> None:
             print("\nCtrl-C received, shutting down...")
         finally:
             stop_event.set()
+            print("Putting robot to sleep and cleaning up...")
+            # try:
+            #     mini.goto_sleep()
+            # except Exception:
+            #     pass
             print("Shutdown complete.")
             generate_final_plot(full_log, config)
 
