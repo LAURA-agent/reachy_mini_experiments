@@ -242,8 +242,9 @@ def main():
     with ReachyMini() as r:
         r.disable_motors()
         while True:
-            head_j, ants = r._get_current_joint_positions()
-            pose = r.head_kinematics.fk(head_j)
+            head_j, ants = r.get_current_joint_positions()
+            pose = r.get_current_head_pose()
+            
             trans_mm = pose[:3, 3] * 1_000
             roll_deg = math.degrees(R.from_matrix(pose[:3, :3]).as_euler("xyz")[0])
 
