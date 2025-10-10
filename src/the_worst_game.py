@@ -335,7 +335,7 @@ def speed_run(
 
     print("\nLevel 1!\n")
 
-    with ReachyMini() as reachy:
+    with ReachyMini(media_backend="no_media") as reachy:
         if compensate_gravity:
             reachy.enable_motors()
             reachy.make_motors_compliant(head=True, antennas=True)
@@ -405,7 +405,7 @@ def precision_mode(compensate_gravity: bool = False) -> None:
     deadline = time.monotonic() + 30
     best = float("inf")
 
-    with ReachyMini() as reachy:
+    with ReachyMini(media_backend="no_media") as reachy:
         if compensate_gravity:
             reachy.enable_motors()
             reachy.make_motors_compliant(head=True, antennas=True)
@@ -481,7 +481,7 @@ def main() -> None:
         "\nGrab your Reachy Mini's head and try to get as close as possible to the target!\n"
     )
 
-    with ReachyMini() as reachy:
+    with ReachyMini(media_backend="no_media") as reachy:
         # Goes to a predefined pose to avoid clearing targets at start
         reachy.enable_motors()
         pose = np.eye(4)
@@ -490,7 +490,6 @@ def main() -> None:
             head=pose,
             antennas=np.array([0.0, 0.0]),
             body_yaw=0.0,
-            check_collision=False,
             duration=1.0,
         )
     state_q.put((40.0, 40.0))  # neutral seed for audio
