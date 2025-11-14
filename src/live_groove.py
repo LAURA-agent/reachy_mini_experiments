@@ -30,7 +30,7 @@ import numpy as np
 import pyaudio
 
 from reachy_mini import ReachyMini, utils
-from reachy_mini.motion.collection.dance import AVAILABLE_MOVES
+from reachy_mini_dances_library.collection.dance import AVAILABLE_MOVES
 
 
 # ───────────────────────────────── Config ────────────────────────────────────
@@ -79,7 +79,7 @@ class Config:
 
     # Neutral pose (position in meters and Euler orientation in radians).
     # Adjust to fit your neutral posture in your setup.
-    neutral_pos: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.02]))
+    neutral_pos: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0]))
     neutral_eul: np.ndarray = field(default_factory=lambda: np.zeros(3))
 
     # The following two are kept for completeness but are not used (smart correction removed).
