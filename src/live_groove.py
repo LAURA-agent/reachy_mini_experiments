@@ -18,6 +18,7 @@ import argparse
 import collections
 import datetime
 import os
+import random
 import sys
 import threading
 import time
@@ -41,10 +42,12 @@ MOVE_AMPLITUDE_OVERRIDES = {
     "dizzy_spin": 0.8,
     "pendulum_swing": 0.4,
     "jackson_square": 0.6,
-    "side_to_side_sway": 0.7,
+    "side_to_side_sway": 0.65,
     "sharp_side_tilt": 0.35,
     "grid_snap": 0.5,
-    "side_peakaboo": 0.4
+    "side_peakaboo": 0.4,
+    "simple_nod": 0.5,
+    "chin_lead": 0.9,
 }
 
 
@@ -77,7 +80,7 @@ class Config:
     noise_subtraction_strength: float = 1.0
 
     # How many most recent BPM estimates to average for stability.
-    bpm_stability_buffer: int = 4
+    bpm_stability_buffer: int = 6
 
     # BPM range clamping - forces BPM into this range by halving/doubling.
     # This fixes half-time/double-time detection issues.
@@ -86,13 +89,13 @@ class Config:
 
     # Max allowed standard deviation over the stability buffer to consider "Locked".
     # Lower threshold = stricter lock; higher = looser (locks faster).
-    bpm_stability_threshold: float = 15.0
+    bpm_stability_threshold: float = 14
 
     # If BPM becomes Unstable, how many consecutive unstable periods we tolerate before pausing motion.
     unstable_periods_before_stop: int = 8
 
     # If we haven't seen audio events for this many seconds, consider silence and stop motion.
-    silence_tmo: float = 3.0
+    silence_tmo: float = 2.0
 
     # Buffer of recent accepted beat times used by the graph and control.
     beat_buffer_size: int = 20
@@ -145,6 +148,7 @@ class Choreographer:
     def __init__(self):
         # Registry of available moves (name -> (fn, base_params, meta))
         self.move_names = list(AVAILABLE_MOVES.keys())
+        random.shuffle(self.move_names)  # Randomize move order
         # Default single waveform; moves that support it will consume it.
         self.waveforms = ["sin"]
         self.move_idx = 0
@@ -161,7 +165,11 @@ class Choreographer:
     def advance(self, beats_this_frame, config: Config):
         self.beat_counter_for_cycle += beats_this_frame
         if self.beat_counter_for_cycle >= config.beats_per_sequence:
-            self.move_idx = (self.move_idx + 1) % len(self.move_names)
+            self.move_idx += 1
+            # Reshuffle when we've played all moves
+            if self.move_idx >= len(self.move_names):
+                random.shuffle(self.move_names)
+                self.move_idx = 0
             self.beat_counter_for_cycle = 0.0
 
 
