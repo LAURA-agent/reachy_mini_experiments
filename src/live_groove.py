@@ -89,13 +89,12 @@ class Config:
     bpm_max: float = 140.0
 
     # Max allowed standard deviation over the stability buffer to consider "Locked".
-    # Very strict: if the beat isn't crystal clear, stop dancing immediately.
-    # Creates more breathing, more dramatic "drops" when re-locking.
-    bpm_stability_threshold: float = 2.5
+    # Lower = stricter, higher = looser. 5.0 allows coasting through brief confusion.
+    bpm_stability_threshold: float = 5.0
 
     # If BPM becomes Unstable, how many consecutive unstable periods we tolerate before pausing motion.
-    # 1 = stop immediately if uncertain. Don't "coast" through messy sections.
-    unstable_periods_before_stop: int = 1
+    # Higher = more patience, lets robot coast through momentary analysis glitches.
+    unstable_periods_before_stop: int = 4
 
     # If we haven't seen audio events for this many seconds, consider silence and stop motion.
     silence_tmo: float = 2.0
@@ -103,7 +102,7 @@ class Config:
     # Volume gate threshold (RMS). Audio quieter than this is treated as silence/motor noise.
     # Prevents self-excitation where robot dances to its own motor sounds.
     # Tune based on your setup - check RawAmp in debug output.
-    volume_gate_threshold: float = 0.015
+    volume_gate_threshold: float = 0.008
 
     # Buffer of recent accepted beat times used by the graph and control.
     beat_buffer_size: int = 20
@@ -458,32 +457,32 @@ def audio_thread(
         if len(buf) < config.audio_buffer_len:
             continue
 
-        # === VOLUME GATE (Anti-Feedback) ===
-        # Calculate RMS energy (more accurate than mean absolute)
-        rms_amplitude = np.sqrt(np.mean(buf**2))
-
-        if rms_amplitude < config.volume_gate_threshold:
-            # Silence or motor noise - force "Gathering" state immediately
-            with state.lock:
-                state.state = "Gathering"
-                state.librosa_bpm = 0.0
-                state.raw_amplitude = rms_amplitude
-                state.last_event_time = 0.0  # Force timeout
-            # Skip expensive beat processing
-            buf = buf[-int(config.audio_rate * config.audio_win):]
-            continue
-
-        # Apply appropriate noise subtraction based on robot state
+        # === 1. NOISE SUBTRACTION FIRST (Clean Gate approach) ===
+        # Remove motor noise BEFORE checking volume, so we gate on music not motors
         analysis_buf = buf
         with state.lock:
             is_breathing = state.is_breathing
         if is_breathing and breathing_noise_profile is not None:
-            # Robot is breathing - filter breathing motor noise
             analysis_buf = subtract_noise(buf, breathing_noise_profile, config.noise_subtraction_strength)
         elif not is_breathing and dance_noise_profile is not None:
-            # Robot is dancing - filter dance motor noise
             analysis_buf = subtract_noise(buf, dance_noise_profile, config.noise_subtraction_strength)
 
+        # === 2. VOLUME GATE ON CLEANED AUDIO ===
+        # Gate on cleaned signal - if motor noise was all there was, this will be near zero
+        rms_amplitude = np.sqrt(np.mean(buf**2))  # Raw for debug display
+        cleaned_rms = np.sqrt(np.mean(analysis_buf**2))  # Cleaned for gate decision
+
+        if cleaned_rms < config.volume_gate_threshold:
+            # After noise removal, nothing left - treat as silence
+            with state.lock:
+                state.state = "Gathering"
+                state.librosa_bpm = 0.0
+                state.raw_amplitude = rms_amplitude
+                state.last_event_time = 0.0
+            buf = buf[-int(config.audio_rate * config.audio_win):]
+            continue
+
+        # === 3. BEAT DETECTION ON CLEANED AUDIO ===
         tempo, beat_frames = librosa.beat.beat_track(
             y=analysis_buf, sr=config.audio_rate, units="frames", tightness=80
         )
@@ -493,9 +492,9 @@ def audio_thread(
         # Clamp BPM to expected range (fixes half-time/double-time confusion)
         tempo_val = clamp_bpm(raw_tempo, config.bpm_min, config.bpm_max)
 
-        # Track amplitudes for debug (RMS already calculated above for gate)
+        # Track amplitudes for debug
         cleaned_amplitude = np.abs(analysis_buf).mean()
-        has_audio = rms_amplitude > config.volume_gate_threshold and len(beat_frames) > 0
+        has_audio = cleaned_rms > config.volume_gate_threshold and len(beat_frames) > 0
 
         with state.lock:
             # Only update last_event_time if we actually detected audio
@@ -626,10 +625,10 @@ def main(config: Config) -> None:
 
     print("Connecting to Reachy Mini...")
     with ReachyMini() as mini:
-        # Skip noise calibration - just use raw audio
-        breathing_noise_profile = None
-        dance_noise_profile = None
-        print("Skipping noise calibration - using raw audio")
+        # Calibrate noise profiles so we can filter out motor sounds
+        print("Starting full calibration sequence...")
+        breathing_noise_profile = calibrate_noise_with_breathing(mini, config)
+        dance_noise_profile = calibrate_dance_noise(mini, config)
 
         # Start audio and UI threads after calibration
         threading.Thread(
@@ -648,6 +647,7 @@ def main(config: Config) -> None:
         is_executing_move = False  # True while a move is in progress
         move_beats_elapsed = 0.0  # Beats since move started
         force_breathing_until = 0.0  # Timestamp until which we must breathe
+        last_active_bpm = 0.0  # Remember BPM for completing moves if beat is lost
 
         print("\nRobot ready — play music!\n")
 
@@ -696,14 +696,15 @@ def main(config: Config) -> None:
                 filtered_beat_times.extend(accepted_this_frame)
                 last_good_beat = filtered_beat_times[-1] if filtered_beat_times else 0.0  # kept for plot consistency
 
-                # Start/continue criteria - require has_ever_locked before any dancing
-                is_allowed_to_start = state == "Locked"
-                is_stable_enough_to_continue = unstable_count < config.unstable_periods_before_stop
-                can_dance = active_bpm > 0 and has_ever_locked and (is_allowed_to_start or (state == "Unstable" and is_stable_enough_to_continue))
+                # Separate criteria for STARTING vs CONTINUING a move
+                # START: Must be Locked (strict) - prevents zombie loop from ghost noise
+                # CONTINUE: Can coast through Unstable using last_active_bpm (loose)
+                can_start_new_move = active_bpm > 0 and has_ever_locked and state == "Locked"
+                can_continue_move = has_ever_locked and (state == "Locked" or (state == "Unstable" and unstable_count < config.unstable_periods_before_stop))
 
                 # Tell audio thread whether we're breathing (so it knows to filter motor noise)
                 with music.lock:
-                    music.is_breathing = not can_dance
+                    music.is_breathing = not (is_executing_move or can_start_new_move)
 
                 # One-shot execution model:
                 # 1. Wait for beat lock (can_dance)
@@ -716,7 +717,9 @@ def main(config: Config) -> None:
 
                 if is_executing_move:
                     # === EXECUTING A MOVE ===
-                    beats_this_frame = dt * (active_bpm / 60.0)
+                    # Use last known BPM if current drops to 0 (lets move complete)
+                    bpm_for_move = active_bpm if active_bpm > 0 else last_active_bpm
+                    beats_this_frame = dt * (bpm_for_move / 60.0)
                     move_beats_elapsed += beats_this_frame
                     t_beats += beats_this_frame
 
@@ -752,11 +755,12 @@ def main(config: Config) -> None:
                             antennas=scaled_ant,
                         )
 
-                elif can_dance and not in_forced_breathing:
+                elif can_start_new_move and not in_forced_breathing:
                     # === START A NEW MOVE ===
                     is_executing_move = True
                     t_beats = 0.0
                     move_beats_elapsed = 0.0
+                    last_active_bpm = active_bpm  # Remember BPM for this move
                     move_name = choreographer.current_move_name()
                     print(f"\n🔥 BEAT DROP! Starting: {move_name}")
 
@@ -800,7 +804,7 @@ def main(config: Config) -> None:
                     "move_name": choreographer.current_move_name(),
                     "waveform": choreographer.current_waveform(),
                     "amp_scale": choreographer.amplitude_scale,
-                    "unstable_pause": not is_stable_enough_to_continue and state == "Unstable",
+                    "unstable_pause": not can_continue_move and state == "Unstable",
                     "bpm_std": bpm_std,
                     "raw_amp": raw_amp,
                     "cleaned_amp": cleaned_amp,
