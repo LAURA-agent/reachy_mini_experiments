@@ -60,8 +60,9 @@ class Config:
     # Main control loop period (s). Lower for tighter control, higher for lower CPU.
     control_ts: float = 0.01
 
-    # Audio analysis window (s). Longer gives more stable BPM, but slower reactions.
-    audio_win: float = 4.0
+    # Audio analysis window (s). Short window = lives in the "now", reacts instantly.
+    # 1.6s is ~1 bar at moderate tempo. Robot loses beat easily, finds it instantly.
+    audio_win: float = 1.6
 
     # Microphone sample rate (Hz). 44100 is common and well supported.
     audio_rate: int = 44100
@@ -88,11 +89,13 @@ class Config:
     bpm_max: float = 140.0
 
     # Max allowed standard deviation over the stability buffer to consider "Locked".
-    # Lower threshold = stricter lock; higher = looser (locks faster).
-    bpm_stability_threshold: float = 14
+    # Very strict: if the beat isn't crystal clear, stop dancing immediately.
+    # Creates more breathing, more dramatic "drops" when re-locking.
+    bpm_stability_threshold: float = 2.5
 
     # If BPM becomes Unstable, how many consecutive unstable periods we tolerate before pausing motion.
-    unstable_periods_before_stop: int = 8
+    # 1 = stop immediately if uncertain. Don't "coast" through messy sections.
+    unstable_periods_before_stop: int = 1
 
     # If we haven't seen audio events for this many seconds, consider silence and stop motion.
     silence_tmo: float = 2.0
@@ -104,8 +107,11 @@ class Config:
     # Increase to remove double triggers; decrease if valid syncopations are dropped.
     min_interval_factor: float = 0.5
 
-    # Auto-advance the dance after this many beats.
+    # Move duration in beats. One full move executes for this many beats.
     beats_per_sequence: int = 8
+
+    # Minimum breathing time (seconds) between moves. Forces a pause after each move completes.
+    min_breathing_between_moves: float = 0.2
 
     # How often the terminal UI refreshes (Hz).
     ui_update_rate: float = 1.0
@@ -507,8 +513,8 @@ def audio_thread(
                 state.state = "Unstable"
                 state.unstable_period_count += 1
 
-        # Keep a rolling audio buffer of ~1.5 s to limit CPU
-        buf = buf[-int(config.audio_rate * 1.5) :]
+        # Keep a rolling audio buffer matching the analysis window
+        buf = buf[-int(config.audio_rate * config.audio_win) :]
 
     stream.stop_stream()
     stream.close()
@@ -620,6 +626,9 @@ def main(config: Config) -> None:
         full_log = []
         t_beats, reference_t_beats = 0.0, 0.0
         breathing_time = 0.0  # Track time for idle breathing animation
+        is_executing_move = False  # True while a move is in progress
+        move_beats_elapsed = 0.0  # Beats since move started
+        force_breathing_until = 0.0  # Timestamp until which we must breathe
 
         print("\nRobot ready — play music!\n")
 
@@ -677,24 +686,70 @@ def main(config: Config) -> None:
                 with music.lock:
                     music.is_breathing = not can_dance
 
-                if can_dance:
+                # One-shot execution model:
+                # 1. Wait for beat lock (can_dance)
+                # 2. Execute ONE full move (beats_per_sequence beats)
+                # 3. Force return to breathing
+                # 4. Wait minimum breathing time before next move
+
+                now = time.time()
+                in_forced_breathing = now < force_breathing_until
+
+                if is_executing_move:
+                    # === EXECUTING A MOVE ===
                     beats_this_frame = dt * (active_bpm / 60.0)
-                    reference_t_beats += beats_this_frame
-                    t_beats = reference_t_beats  # no smart correction
+                    move_beats_elapsed += beats_this_frame
+                    t_beats += beats_this_frame
 
-                    choreographer.advance(beats_this_frame, config)
+                    # Check if move is complete
+                    if move_beats_elapsed >= config.beats_per_sequence:
+                        # Move finished - force breathing
+                        is_executing_move = False
+                        force_breathing_until = now + config.min_breathing_between_moves
+                        choreographer.move_idx = (choreographer.move_idx + 1) % len(choreographer.move_names)
+                        print(f"   Move complete. Breathing for {config.min_breathing_between_moves}s...")
+                    else:
+                        # Continue executing move
+                        move_name = choreographer.current_move_name()
+                        move_fn, base_params, _ = AVAILABLE_MOVES[move_name]
+                        params = base_params.copy()
+
+                        if "waveform" in params:
+                            params["waveform"] = choreographer.current_waveform()
+
+                        offsets = move_fn(t_beats, **params)
+
+                        amp_scale = MOVE_AMPLITUDE_OVERRIDES.get(move_name, 1.0)
+                        scaled_pos = offsets.position_offset * amp_scale
+                        scaled_ori = offsets.orientation_offset * amp_scale
+                        scaled_ant = offsets.antennas_offset * amp_scale
+
+                        mini.set_target(
+                            utils.create_head_pose(
+                                *(config.neutral_pos + scaled_pos),
+                                *(config.neutral_eul + scaled_ori),
+                                degrees=False,
+                            ),
+                            antennas=scaled_ant,
+                        )
+
+                elif can_dance and not in_forced_breathing:
+                    # === START A NEW MOVE ===
+                    is_executing_move = True
+                    t_beats = 0.0
+                    move_beats_elapsed = 0.0
                     move_name = choreographer.current_move_name()
+                    print(f"\n🔥 BEAT DROP! Starting: {move_name}")
 
+                    # Execute first frame of the move
                     move_fn, base_params, _ = AVAILABLE_MOVES[move_name]
                     params = base_params.copy()
 
-                    # If the move supports waveform, use the default single waveform.
                     if "waveform" in params:
                         params["waveform"] = choreographer.current_waveform()
 
                     offsets = move_fn(t_beats, **params)
 
-                    # Apply per-move amplitude scaling
                     amp_scale = MOVE_AMPLITUDE_OVERRIDES.get(move_name, 1.0)
                     scaled_pos = offsets.position_offset * amp_scale
                     scaled_ori = offsets.orientation_offset * amp_scale
@@ -708,8 +763,9 @@ def main(config: Config) -> None:
                         ),
                         antennas=scaled_ant,
                     )
+
                 else:
-                    # Idle state - use breathing motion instead of static neutral
+                    # === BREATHING ===
                     breathing_time += dt
                     breath_pos, breath_ori, breath_ant = compute_breathing_pose(breathing_time, config)
                     mini.set_target(
