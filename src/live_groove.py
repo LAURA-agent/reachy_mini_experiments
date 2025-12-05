@@ -100,6 +100,11 @@ class Config:
     # If we haven't seen audio events for this many seconds, consider silence and stop motion.
     silence_tmo: float = 2.0
 
+    # Volume gate threshold (RMS). Audio quieter than this is treated as silence/motor noise.
+    # Prevents self-excitation where robot dances to its own motor sounds.
+    # Tune based on your setup - check RawAmp in debug output.
+    volume_gate_threshold: float = 0.015
+
     # Buffer of recent accepted beat times used by the graph and control.
     beat_buffer_size: int = 20
 
@@ -453,6 +458,21 @@ def audio_thread(
         if len(buf) < config.audio_buffer_len:
             continue
 
+        # === VOLUME GATE (Anti-Feedback) ===
+        # Calculate RMS energy (more accurate than mean absolute)
+        rms_amplitude = np.sqrt(np.mean(buf**2))
+
+        if rms_amplitude < config.volume_gate_threshold:
+            # Silence or motor noise - force "Gathering" state immediately
+            with state.lock:
+                state.state = "Gathering"
+                state.librosa_bpm = 0.0
+                state.raw_amplitude = rms_amplitude
+                state.last_event_time = 0.0  # Force timeout
+            # Skip expensive beat processing
+            buf = buf[-int(config.audio_rate * config.audio_win):]
+            continue
+
         # Apply appropriate noise subtraction based on robot state
         analysis_buf = buf
         with state.lock:
@@ -473,10 +493,9 @@ def audio_thread(
         # Clamp BPM to expected range (fixes half-time/double-time confusion)
         tempo_val = clamp_bpm(raw_tempo, config.bpm_min, config.bpm_max)
 
-        # Check RAW audio for presence (not cleaned - noise subtraction can be too aggressive)
-        raw_amplitude = np.abs(buf).mean()
-        cleaned_amplitude = np.abs(analysis_buf).mean()  # Still track for debug
-        has_audio = raw_amplitude > 0.005 and len(beat_frames) > 0
+        # Track amplitudes for debug (RMS already calculated above for gate)
+        cleaned_amplitude = np.abs(analysis_buf).mean()
+        has_audio = rms_amplitude > config.volume_gate_threshold and len(beat_frames) > 0
 
         with state.lock:
             # Only update last_event_time if we actually detected audio
@@ -498,7 +517,7 @@ def audio_thread(
                     state.beats.append(t)
 
             # Track debug values
-            state.raw_amplitude = raw_amplitude
+            state.raw_amplitude = rms_amplitude
             state.cleaned_amplitude = cleaned_amplitude
             state.bpm_std = float(np.std(bpm_hist)) if len(bpm_hist) > 1 else 0.0
 
@@ -545,7 +564,7 @@ def ui_thread(data_queue: Queue, config: Config, stop_event: threading.Event):
             f"🎵 Music State: {last_data['state']:<10} | BPM (Active/Raw): "
             f"{last_data['active_bpm']:.1f}/{last_data['raw_bpm']:.1f}{paused_status}\n"
             f"📊 Debug: StdDev={last_data.get('bpm_std', 0):.2f} (need <{config.bpm_stability_threshold}) | "
-            f"RawAmp={last_data.get('raw_amp', 0):.4f} (need >0.005) | EverLocked={locked_status}\n"
+            f"RawAmp={last_data.get('raw_amp', 0):.4f} (need >{config.volume_gate_threshold}) | EverLocked={locked_status}\n"
             f"🕺 Dance State: {last_data['move_name']:<25} | Wave: {last_data['waveform']:<8} | Amp: {last_data['amp_scale']:.1f}x\n"
             f"⚙️  Settings: Auto mode | Beats/sequence: {config.beats_per_sequence}\n"
             + "─" * 80
